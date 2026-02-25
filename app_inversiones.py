@@ -463,3 +463,13 @@ elif sel == "📊 Corp. Finance: Opt & Forecast": page_optimize_and_forecast()
 elif sel == "🔭 Pronóstico Avanzado (Models)": page_forecast()
 elif sel == "📰 Analizador de Eventos":     page_event_analyzer()
 elif sel == "💬 Chat IA Financiero":        page_investment_insights_chat()
+
+
+# Validación de seguridad: si la página guardada no está en la lista actual, usa el índice 0 ("Inicio")
+if st.session_state.selected_page in page_options:
+    default_index = page_options.index(st.session_state.selected_page)
+else:
+    default_index = 0
+    st.session_state.selected_page = page_options[0]
+
+page = st.sidebar.radio("Sección", page_options, index=default_index)
