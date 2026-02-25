@@ -364,9 +364,9 @@ with st.sidebar.expander("🧠 Configuración IA (Gemini)", expanded=True):
     
     # Selector de Modelos solicitados
     model_options = [
-        "gemini-2.0-flash",   # Equivalente a tu pedido de 'gemini2.5flash' (lo más rápido y nuevo)
-        "gemini-1.5-pro",     # Modelo potente (razonamiento alto)
-        "gemini-1.5-flash"    # Versión estable rápida
+        "gemini-2.5-flash",   # Equivalente a tu pedido de 'gemini2.5flash' (lo más rápido y nuevo)
+        "gemini-3",     # Modelo potente (razonamiento alto)
+       
     ]
     st.session_state.gemini_model = st.selectbox("Modelo IA", model_options, index=0)
     
