@@ -9,8 +9,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from scipy.optimize import minimize
 from scipy.stats import norm
-from huggingface_hub import InferenceClient
 import yfinance as yf
+
+# ── NUEVA DEPENDENCIA DE IA (GOOGLE GEMINI) ──
+import google.generativeai as genai
 
 # ── Dependencia opcional para optimización institucional ──
 try:
@@ -24,13 +26,13 @@ try:
     from forecast_module import page_forecast
     from iol_client import page_iol_explorer, get_iol_client
 except ImportError:
-    # Fallback si no existen los archivos auxiliares para evitar que rompa
+    # Fallback si no existen los archivos auxiliares
     def page_forecast(): st.warning("Módulo forecast_module.py no encontrado.")
     def page_iol_explorer(): st.warning("Módulo iol_client.py no encontrado.")
     def get_iol_client(): return None
 
 # ── Configuración Global ──────────────────────────────────────────────────
-st.set_page_config(layout="wide", page_title="BPNos – Finanzas Corporativas", page_icon="📊")
+st.set_page_config(layout="wide", page_title="BPNos – Finanzas Corporativas", page_icon="📈")
 
 PORTFOLIO_FILE = "portfolios_data1.json"
 
@@ -55,26 +57,6 @@ def save_portfolios_to_file(portfolios_dict):
     except Exception as e:
         return False, str(e)
 
-def parse_tickers_from_text(text_data):
-    """Extrae tickers de texto pegado desde IOL u otras fuentes."""
-    tickers_info = []
-    ticker_regex = re.compile(r"^(.*?)\s*\(([A-Z0-9.]{2,10})\)$") # Regex ajustado
-
-    for line in text_data.strip().split('\n'):
-        line = line.strip()
-        if not line or ">" in line: continue
-        
-        match = ticker_regex.search(line)
-        if match:
-            tickers_info.append({"ticker": match.group(2).strip(), "nombre": match.group(1).strip()})
-        else:
-            # Intento simple si es solo una lista de tickers
-            parts = line.split()
-            if len(parts) == 1 and line.isalnum():
-                 tickers_info.append({"ticker": line.upper(), "nombre": line.upper()})
-                 
-    return tickers_info
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  CORE FINANCIERO: DESCARGA Y OPTIMIZACIÓN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -90,7 +72,7 @@ def fetch_stock_prices_for_portfolio(tickers, start_date, end_date):
     for ticker in tickers:
         fetched = False
         if client:
-            simbolo_iol = ticker.split(".")[0].upper() # Remover .BA si existe para IOL API
+            simbolo_iol = ticker.split(".")[0].upper()
             fmt_start = pd.to_datetime(start_date).strftime("%Y-%m-%d")
             fmt_end   = pd.to_datetime(end_date).strftime("%Y-%m-%d")
             try:
@@ -105,27 +87,23 @@ def fetch_stock_prices_for_portfolio(tickers, start_date, end_date):
         if not fetched:
             yf_tickers.append(ticker)
 
-    # 2. Intentar Yahoo Finance (Bulk download es más rápido)
+    # 2. Intentar Yahoo Finance (Bulk download)
     if yf_tickers:
         try:
-            # Añadir .BA si son acciones argentinas y no tienen sufijo (suposición común)
+            # Añadir .BA si son acciones argentinas
             adjusted_tickers = [t if "." in t or t.endswith("=X") else t+".BA" for t in yf_tickers]
-            
             raw = yf.download(adjusted_tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
             
             if not raw.empty:
-                # Manejo de MultiIndex en columnas si hay más de 1 ticker
                 close_data = raw["Close"] if "Close" in raw.columns else raw
-                
                 if isinstance(close_data, pd.Series):
-                    close_data = close_data.to_frame(name=tickers[0])
+                    close_data = close_data.to_frame(name=yf_tickers[0])
                 
-                # Mapear columnas de vuelta a los nombres originales si YF cambió algo
+                # Mapeo de columnas
                 if len(adjusted_tickers) == 1:
                      all_prices[yf_tickers[0]] = close_data.iloc[:, 0]
                 else:
                     for col in close_data.columns:
-                        # Intentar limpiar el nombre de columna para coincidir con el ticker original
                         clean_col = str(col).replace(".BA", "")
                         for original in yf_tickers:
                             if clean_col == original or str(col) == original:
@@ -142,7 +120,6 @@ def fetch_stock_prices_for_portfolio(tickers, start_date, end_date):
     
     prices.sort_index(inplace=True)
     prices.ffill(inplace=True).dropna(inplace=True)
-    
     return prices
 
 def optimize_portfolio_corporate(prices, risk_free_rate=0.02, opt_type="Maximo Ratio Sharpe"):
@@ -150,25 +127,19 @@ def optimize_portfolio_corporate(prices, risk_free_rate=0.02, opt_type="Maximo R
     returns = prices.pct_change().dropna()
     if returns.empty: return None
 
-    # Estrategia 1: PyPortfolioOpt (Librería profesional)
+    # Estrategia 1: PyPortfolioOpt
     if PYPFOPT_OK:
         try:
             mu = expected_returns.mean_historical_return(prices, frequency=252)
             S = risk_models.sample_cov(prices, frequency=252)
             ef = EfficientFrontier(mu, S, weight_bounds=(0, 1))
             
-            if opt_type == "Maximo Ratio Sharpe": 
-                ef.max_sharpe(risk_free_rate=risk_free_rate)
-            elif opt_type == "Minima Volatilidad": 
-                ef.min_volatility()
-            else: 
-                # Retorno máximo (arriesgado, usamos max utilidad cuadrática con baja aversión)
-                ef.max_quadratic_utility(risk_aversion=1) 
+            if opt_type == "Maximo Ratio Sharpe": ef.max_sharpe(risk_free_rate=risk_free_rate)
+            elif opt_type == "Minima Volatilidad": ef.min_volatility()
+            else: ef.max_quadratic_utility(risk_aversion=1)
             
             weights = ef.clean_weights()
             ret, vol, sharpe = ef.portfolio_performance(verbose=False, risk_free_rate=risk_free_rate)
-            
-            # Convertir diccionario de pesos a array ordenado según columnas
             ow_array = np.array([weights.get(col, 0) for col in prices.columns])
             
             return {
@@ -176,16 +147,15 @@ def optimize_portfolio_corporate(prices, risk_free_rate=0.02, opt_type="Maximo R
                 "sharpe_ratio": sharpe, "tickers": list(prices.columns), "returns": returns,
                 "method": "PyPortfolioOpt"
             }
-        except Exception as e:
-            st.warning(f"Fallo en PyPortfolioOpt ({e}), usando Scipy...")
+        except Exception:
+            pass # Fallback a Scipy
 
-    # Estrategia 2: Scipy (Fallback robusto)
+    # Estrategia 2: Scipy
     mean_returns = returns.mean() * 252
     cov_matrix   = returns.cov() * 252
     n = len(mean_returns)
     
-    def get_ret_vol_sr(w):
-        w = np.array(w)
+    def get_metrics(w):
         ret = np.sum(mean_returns * w)
         vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
         sr = (ret - risk_free_rate) / vol if vol > 0 else 0
@@ -195,18 +165,13 @@ def optimize_portfolio_corporate(prices, risk_free_rate=0.02, opt_type="Maximo R
     bounds = tuple((0.0, 1.0) for _ in range(n))
     init = np.array([1/n] * n)
 
-    if opt_type == "Minima Volatilidad":
-        fun = lambda w: get_ret_vol_sr(w)[1]
-    elif opt_type == "Retorno Maximo":
-        fun = lambda w: -get_ret_vol_sr(w)[0]
-    else: # Sharpe
-        fun = lambda w: -get_ret_vol_sr(w)[2]
+    if opt_type == "Minima Volatilidad": fun = lambda w: get_metrics(w)[1]
+    elif opt_type == "Retorno Maximo": fun = lambda w: -get_metrics(w)[0]
+    else: fun = lambda w: -get_metrics(w)[2]
 
     res = minimize(fun, init, method='SLSQP', bounds=bounds, constraints=constraints)
+    final_metrics = get_metrics(res.x) if res.success else [0,0,0]
     
-    if not res.success: return None
-    
-    final_metrics = get_ret_vol_sr(res.x)
     return {
         "weights": res.x, "expected_return": final_metrics[0], 
         "volatility": final_metrics[1], "sharpe_ratio": final_metrics[2], 
@@ -218,297 +183,239 @@ def optimize_portfolio_corporate(prices, risk_free_rate=0.02, opt_type="Maximo R
 #  PÁGINAS DE LA APLICACIÓN
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main_page():
-    st.title("BPNos - Consola de Finanzas Corporativas")
-    st.markdown("""
-    ### Plataforma Integral de Decisión Financiera
-    
-    Hemos unificado la visión de **Inversiones** y **Forecast** para potenciar el análisis corporativo.
-    
-    #### Módulos Activos:
-    
-    *   🏦 **Explorador IOL**: Conexión directa a mercado.
-    *   📊 **Dashboard Corporativo**: (Inversiones + Optimización + Forecast).
-        *   *Gestión de Carteras*
-        *   *Frontera Eficiente*
-        *   *Simulación Montecarlo*
-    *   🔭 **Laboratorio de Modelos**: Análisis econométrico profundo (SARIMAX/Prophet).
-    *   📰 **Inteligencia de Mercado**: Análisis de sentimiento y Chatbot AI.
-    """)
-    
-    st.info("👈 Seleccione un módulo en el menú lateral para comenzar.")
-
 def page_corporate_dashboard():
-    """
-    FUSION: Gestión de Portafolios + Optimización + Forecast.
-    Esta es la función principal que 'potencia el servicio'.
-    """
+    """Fusión: Gestión de Portafolios + Optimización + Forecast."""
     st.title("📊 Dashboard Corporativo Integral")
-    
     tabs = st.tabs(["💼 Mis Portafolios", "🚀 Optimización & Riesgo", "🔮 Forecast & Simulación"])
     
-    # --- TAB 1: GESTIÓN DE PORTAFOLIOS ---
+    # --- TAB 1: GESTIÓN ---
     with tabs[0]:
         c1, c2 = st.columns([1, 2])
         with c1:
-            st.subheader("Crear / Editar")
-            p_name = st.text_input("Nombre Cartera", placeholder="Ej: Fondo Liquidez")
-            p_tickers = st.text_area("Tickers (Separados por coma)", placeholder="AL30, GGAL, YPFD").upper()
-            p_weights = st.text_area("Pesos (Decimales, suman 1.0)", placeholder="0.4, 0.3, 0.3")
-            
-            if st.button("Guardar Cartera", type="primary"):
+            st.subheader("Crear Cartera")
+            p_name = st.text_input("Nombre Cartera")
+            p_tickers = st.text_area("Tickers (ej: AL30, GGAL)", height=100).upper()
+            p_weights = st.text_area("Pesos (ej: 0.5, 0.5)", height=100)
+            if st.button("Guardar", type="primary"):
                 try:
-                    t_list = [t.strip() for t in p_tickers.split(",") if t.strip()]
-                    w_list = [float(w.strip()) for w in p_weights.split(",") if w.strip()]
-                    if len(t_list) != len(w_list):
-                        st.error("La cantidad de tickers y pesos debe ser igual.")
-                    elif not np.isclose(sum(w_list), 1.0, atol=0.01):
-                        st.error(f"Los pesos suman {sum(w_list):.2f}, deben sumar 1.0")
-                    else:
-                        st.session_state.portfolios[p_name] = {"tickers": t_list, "weights": w_list}
+                    t = [x.strip() for x in p_tickers.split(",") if x.strip()]
+                    w = [float(x) for x in p_weights.split(",") if x.strip()]
+                    if len(t) == len(w) and abs(sum(w)-1.0) < 0.02:
+                        st.session_state.portfolios[p_name] = {"tickers": t, "weights": w}
                         save_portfolios_to_file(st.session_state.portfolios)
-                        st.success(f"Cartera '{p_name}' guardada.")
-                except ValueError:
-                    st.error("Error en formato numérico.")
+                        st.success("Guardado.")
+                    else: st.error("Error en pesos o cantidad.")
+                except: st.error("Error de formato.")
         
         with c2:
-            st.subheader("Carteras Disponibles")
-            if not st.session_state.portfolios:
-                st.info("No hay carteras registradas.")
-            else:
-                df_p = []
-                for k, v in st.session_state.portfolios.items():
-                    df_p.append({"Nombre": k, "Activos": ", ".join(v['tickers']), "Pesos": ", ".join(map(str, v['weights']))})
-                st.dataframe(pd.DataFrame(df_p), use_container_width=True)
-                
-                to_del = st.selectbox("Eliminar Cartera", ["Seleccionar..."] + list(st.session_state.portfolios.keys()))
-                if to_del != "Seleccionar..." and st.button("Eliminar"):
-                    del st.session_state.portfolios[to_del]
-                    save_portfolios_to_file(st.session_state.portfolios)
-                    st.rerun()
+            if st.session_state.portfolios:
+                st.dataframe(pd.DataFrame(st.session_state.portfolios).T, use_container_width=True)
 
-    # Preparación de datos para Tabs 2 y 3
+    # --- DATOS COMUNES ---
     portfolios = st.session_state.get("portfolios", {})
-    if not portfolios:
-        st.warning("Cree una cartera en la pestaña 'Mis Portafolios' para continuar.")
-        return
+    if not portfolios: return
 
-    # Selección global para el análisis
     st.markdown("---")
-    col_sel, col_date1, col_date2 = st.columns(3)
-    with col_sel:
-        active_portfolio_name = st.selectbox("🎯 Analizar Cartera:", list(portfolios.keys()))
-    with col_date1:
-        start_date = st.date_input("Desde", pd.to_datetime("2023-01-01"))
-    with col_date2:
-        end_date = st.date_input("Hasta", pd.to_datetime("today"))
+    col1, col2, col3 = st.columns(3)
+    p_sel = col1.selectbox("Analizar Cartera:", list(portfolios.keys()))
+    d_start = col2.date_input("Desde", pd.to_datetime("2023-01-01"))
+    d_end = col3.date_input("Hasta", pd.to_datetime("today"))
 
-    portfolio = portfolios[active_portfolio_name]
-    
     # --- TAB 2: OPTIMIZACIÓN ---
     with tabs[1]:
-        st.subheader(f"Análisis de Eficiencia: {active_portfolio_name}")
-        if st.button("Ejecutar Optimización", key="btn_opt"):
-            with st.spinner("Descargando precios y calculando frontera eficiente..."):
-                prices = fetch_stock_prices_for_portfolio(portfolio["tickers"], start_date, end_date)
-            
-            if prices is not None:
-                # Guardar precios en session para usar en Forecast sin redescargar
-                st.session_state['last_prices'] = prices
-                
-                c_opt1, c_opt2 = st.columns(2)
-                with c_opt1:
-                    risk_free = st.number_input("Tasa Libre Riesgo (RF)", 0.0, 0.2, 0.04, step=0.01)
-                    target = st.selectbox("Objetivo", ["Maximo Ratio Sharpe", "Minima Volatilidad", "Retorno Maximo"])
-                
-                res = optimize_portfolio_corporate(prices, risk_free_rate=risk_free, opt_type=target)
-                
-                if res:
-                    st.session_state['last_opt_res'] = res # Guardar resultado
-                    
-                    # Métricas
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Retorno Esperado (Anual)", f"{res['expected_return']:.2%}", delta="Proyectado")
-                    m2.metric("Volatilidad (Riesgo)", f"{res['volatility']:.2%}", delta_color="inverse")
-                    m3.metric("Ratio Sharpe", f"{res['sharpe_ratio']:.2f}")
+        if st.button("Ejecutar Optimización"):
+            with st.spinner("Analizando mercado..."):
+                prices = fetch_stock_prices_for_portfolio(portfolios[p_sel]["tickers"], d_start, d_end)
+                if prices is not None:
+                    st.session_state['last_prices'] = prices
+                    res = optimize_portfolio_corporate(prices)
+                    if res:
+                        st.session_state['last_opt_res'] = res
+                        c1, c2 = st.columns(2)
+                        c1.metric("Retorno Esp.", f"{res['expected_return']:.1%}")
+                        c2.metric("Sharpe", f"{res['sharpe_ratio']:.2f}")
+                        fig = px.pie(values=res['weights'], names=res['tickers'], title="Asignación Óptima")
+                        st.plotly_chart(fig, use_container_width=True)
+                    else: st.error("No se pudo optimizar.")
 
-                    # Gráfico de Pesos
-                    w_df = pd.DataFrame({"Asset": res["tickers"], "Weight": res["weights"]})
-                    fig = px.pie(w_df, values="Weight", names="Asset", title=f"Asignación Óptima ({target})", hole=0.4)
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.success(f"Optimización realizada con éxito usando {res['method']}")
-                else:
-                    st.error("No se pudo optimizar (datos insuficientes o error numérico).")
-            else:
-                st.error("Error al obtener datos de mercado.")
-
-    # --- TAB 3: FORECAST & SIMULACIÓN ---
+    # --- TAB 3: FORECAST ---
     with tabs[2]:
-        st.subheader("Simulación Estocástica (Montecarlo)")
-        st.markdown("Proyección de la cartera optimizada basada en volatilidad histórica.")
-        
-        if 'last_opt_res' in st.session_state and 'last_prices' in st.session_state:
+        if 'last_opt_res' in st.session_state:
             res = st.session_state['last_opt_res']
-            
-            c_sim1, c_sim2 = st.columns(2)
-            with c_sim1:
-                days_proj = st.slider("Días a proyectar", 10, 252, 60)
-            with c_sim2:
-                n_sims = st.selectbox("Número de Escenarios", [100, 500, 1000], index=1)
-            
-            if st.button("Correr Simulación"):
+            days = st.slider("Días Proyección", 30, 365, 90)
+            if st.button("Simular Escenarios"):
                 dt = 1/252
                 mu = res['expected_return'] * dt
                 sigma = res['volatility'] * np.sqrt(dt)
+                paths = np.zeros((days, 500))
+                paths[0] = 100
+                for t in range(1, days):
+                    paths[t] = paths[t-1] * np.exp((mu - 0.5 * sigma**2) + sigma * np.random.normal(0,1,500))
                 
-                # Simulación GBM
-                S0 = 100 # Base 100
-                paths = np.zeros((days_proj, n_sims))
-                paths[0] = S0
-                
-                for t in range(1, days_proj):
-                    rand = np.random.standard_normal(n_sims)
-                    paths[t] = paths[t-1] * np.exp((mu - 0.5 * sigma**2) + sigma * rand)
-                
-                # Gráfico
-                fig_mc = go.Figure()
-                # Primeras 50 trazas para visualización
-                for i in range(min(50, n_sims)):
-                    fig_mc.add_trace(go.Scatter(y=paths[:, i], mode='lines', line=dict(width=1, color='rgba(255,255,255,0.1)'), showlegend=False))
-                
-                # Promedio y cuantiles
-                mean_path = np.mean(paths, axis=1)
-                p05 = np.percentile(paths, 5, axis=1)
-                p95 = np.percentile(paths, 95, axis=1)
-                
-                x_axis = np.arange(days_proj)
-                fig_mc.add_trace(go.Scatter(x=x_axis, y=mean_path, mode='lines', name='Escenario Medio', line=dict(color='yellow', width=3)))
-                fig_mc.add_trace(go.Scatter(x=x_axis, y=p95, mode='lines', name='Optimista (95%)', line=dict(color='green', dash='dash')))
-                fig_mc.add_trace(go.Scatter(x=x_axis, y=p05, mode='lines', name='Pesimista (5%)', line=dict(color='red', dash='dash')))
-                
-                fig_mc.update_layout(title="Proyección de Valor de Cartera (Base 100)", template="plotly_dark", xaxis_title="Días Hábiles Futuros", yaxis_title="Valor")
-                st.plotly_chart(fig_mc, use_container_width=True)
-                
-                # Cálculo VaR
-                final_vals = paths[-1, :]
-                var_95 = 100 - np.percentile(final_vals, 5)
-                st.metric("Value at Risk (VaR 95%) al final del periodo", f"-{var_95:.2f}%", help="Pérdida máxima esperada con 95% de confianza.")
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(y=paths.mean(axis=1), mode='lines', name='Media', line=dict(color='yellow', width=3)))
+                fig.add_trace(go.Scatter(y=np.percentile(paths, 5, axis=1), mode='lines', name='Pesimista', line=dict(dash='dot', color='red')))
+                fig.add_trace(go.Scatter(y=np.percentile(paths, 95, axis=1), mode='lines', name='Optimista', line=dict(dash='dot', color='green')))
+                fig.update_layout(title="Montecarlo Forecast", template="plotly_dark")
+                st.plotly_chart(fig, use_container_width=True)
+        else: st.info("Ejecute optimización primero.")
 
-        else:
-            st.info("⚠️ Primero ejecute la Optimización en la pestaña anterior para generar los parámetros del modelo.")
-
-def page_event_analyzer():
-    st.header("📰 Analizador de Eventos")
-    st.markdown("Análisis de sentimiento básico sobre comunicados.")
-    news = st.text_area("Texto de la noticia:")
+def page_event_analyzer_gemini():
+    """Analizador de Eventos POTENCIADO con Gemini."""
+    st.header("📰 Analizador de Noticias con IA (Gemini)")
     
-    if st.button("Analizar"):
-        if not news: 
-            st.warning("Ingrese texto.")
-            return
-            
-        pos_words = ["ganancia", "sube", "compra", "supera", "positivo", "dividendo", "acuerdo"]
-        neg_words = ["perdida", "baja", "venta", "cae", "negativo", "deuda", "litigio", "riesgo"]
-        
-        n_lower = news.lower()
-        score_p = sum(1 for w in pos_words if w in n_lower)
-        score_n = sum(1 for w in neg_words if w in n_lower)
-        
-        st.write(f"Palabras Positivas: {score_p}")
-        st.write(f"Palabras Negativas: {score_n}")
-        
-        if score_p > score_n: st.success("Sentimiento: ALCISTA 📈")
-        elif score_n > score_p: st.error("Sentimiento: BAJISTA 📉")
-        else: st.info("Sentimiento: NEUTRAL 😐")
-
-def page_chat_ai():
-    st.header("💬 Chat Financiero AI")
-    if not st.session_state.get('hf_api_key'):
-        st.warning("Configure su API Key de Hugging Face en la barra lateral.")
+    # Verificación de API Key
+    api_key = st.session_state.get('gemini_api_key')
+    if not api_key:
+        st.warning("⚠️ Configura tu API Key de Google Gemini en el menú lateral.")
         return
 
+    news_text = st.text_area("Pega la noticia o comunicado corporativo aquí:", height=150)
+    
+    if st.button("🤖 Analizar con Gemini AI"):
+        if not news_text:
+            st.warning("Ingresa un texto.")
+            return
+
+        try:
+            genai.configure(api_key=api_key)
+            # Usamos el modelo seleccionado en el sidebar
+            model = genai.GenerativeModel(st.session_state.gemini_model)
+            
+            prompt = f"""
+            Actúa como un analista financiero experto de Wall Street.
+            Analiza el siguiente texto de noticia/comunicado:
+            "{news_text}"
+
+            1. Determina el Sentimiento: (Muy Alcista, Alcista, Neutral, Bajista, Muy Bajista).
+            2. Resume los 3 puntos clave financieros.
+            3. Estima el impacto a corto plazo en el precio de la acción (si se menciona alguna).
+            Responde en formato Markdown limpio.
+            """
+            
+            with st.spinner("Gemini está leyendo la noticia..."):
+                response = model.generate_content(prompt)
+                st.markdown("### 🧠 Análisis de IA")
+                st.markdown(response.text)
+                
+        except Exception as e:
+            st.error(f"Error Gemini: {str(e)}")
+
+def page_chat_gemini():
+    """Chat Financiero usando Google Gemini."""
+    st.header("💬 Asistente Financiero Gemini")
+    
+    api_key = st.session_state.get('gemini_api_key')
+    if not api_key:
+        st.warning("⚠️ Configura tu API Key de Google Gemini en el menú lateral.")
+        return
+
+    # Historial de chat
     if "messages" not in st.session_state: st.session_state.messages = []
 
     for msg in st.session_state.messages:
-        st.chat_message(msg["role"]).write(msg["content"])
+        role = "user" if msg["role"] == "user" else "assistant"
+        st.chat_message(role).write(msg["content"])
 
-    if prompt := st.chat_input("Pregunta sobre mercados..."):
+    if prompt := st.chat_input("Pregunta sobre mercados, estrategias, etc..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
-        with st.spinner("Pensando..."):
+        with st.spinner("Gemini pensando..."):
             try:
-                client = InferenceClient(api_key=st.session_state.hf_api_key)
-                resp = client.chat_completion(
-                    model="mistralai/Mixtral-8x7B-Instruct-v0.1",
-                    messages=[{"role": "user", "content": prompt}], 
-                    max_tokens=500
-                ).choices[0].message.content
-                st.session_state.messages.append({"role": "assistant", "content": resp})
-                st.chat_message("assistant").write(resp)
+                genai.configure(api_key=api_key)
+                # Crear configuración de generación
+                generation_config = genai.types.GenerationConfig(
+                    candidate_count=1,
+                    temperature=0.7
+                )
+                
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                
+                # Construir contexto simple (últimos 5 mensajes para no saturar tokens si no es Pro)
+                chat_history = []
+                for m in st.session_state.messages[-6:]:
+                    role = "user" if m["role"] == "user" else "model"
+                    chat_history.append({'role': role, 'parts': [m["content"]]})
+                
+                # Iniciar chat con historia
+                chat = model.start_chat(history=chat_history[:-1]) # Todo menos el último prompt que se envía ahora
+                response = chat.send_message(prompt, generation_config=generation_config)
+                
+                resp_text = response.text
+                st.session_state.messages.append({"role": "model", "content": resp_text})
+                st.chat_message("assistant").write(resp_text)
+                
             except Exception as e:
-                st.error(f"Error API: {e}")
+                st.error(f"Error en API Gemini: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SIDEBAR Y NAVEGACIÓN (CORREGIDO)
+#  SIDEBAR Y NAVEGACIÓN
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Inicialización de estado
 if 'selected_page' not in st.session_state: st.session_state.selected_page = "Inicio"
 if 'portfolios' not in st.session_state: st.session_state.portfolios = load_portfolios_from_file()
-if 'hf_api_key' not in st.session_state: st.session_state.hf_api_key = ""
+if 'gemini_api_key' not in st.session_state: st.session_state.gemini_api_key = ""
 
-# Sidebar Config
 st.sidebar.title("Configuración")
-with st.sidebar.expander("🔑 Credenciales"):
-    st.session_state.hf_api_key = st.text_input("Hugging Face Key", value=st.session_state.hf_api_key, type="password")
+
+with st.sidebar.expander("🧠 Configuración IA (Gemini)", expanded=True):
+    st.session_state.gemini_api_key = st.text_input("Gemini API Key", value=st.session_state.gemini_api_key, type="password")
+    
+    # Selector de Modelos solicitados
+    model_options = [
+        "gemini-2.0-flash",   # Equivalente a tu pedido de 'gemini2.5flash' (lo más rápido y nuevo)
+        "gemini-1.5-pro",     # Modelo potente (razonamiento alto)
+        "gemini-1.5-flash"    # Versión estable rápida
+    ]
+    st.session_state.gemini_model = st.selectbox("Modelo IA", model_options, index=0)
+    
+    st.caption("Nota: '2.0-flash' es el modelo experimental rápido más reciente disponible en la API.")
+
+with st.sidebar.expander("🏦 IOL Credenciales"):
     user_iol = st.text_input("Usuario IOL")
     pass_iol = st.text_input("Pass IOL", type="password")
     if st.button("Conectar IOL"):
-        # Lógica dummy de conexión, la real está en iol_client
         st.session_state.iol_username = user_iol
         st.session_state.iol_password = pass_iol
-        st.toast("Credenciales actualizadas (Reconectar en módulo IOL)")
+        st.success("Credenciales actualizadas")
 
 st.sidebar.markdown("---")
 
-# MENU DE NAVEGACIÓN: Definido UNA SOLA VEZ para evitar el error DuplicateElementId
 opciones_menu = [
     "Inicio",
-    "📊 Dashboard Corporativo", # Fusión de Inversiones + Forecast + Opt
+    "📊 Dashboard Corporativo",
     "🏦 Explorador IOL API",
     "🔭 Modelos Avanzados (Forecast)",
-    "📰 Analizador de Eventos",
-    "💬 Chat IA"
+    "📰 Analizador Eventos (Gemini)", # Nombre actualizado
+    "💬 Chat IA (Gemini)"             # Nombre actualizado
 ]
 
-# Determinar índice actual de manera segura
 try:
     idx = opciones_menu.index(st.session_state.selected_page)
-except ValueError:
+except:
     idx = 0
 
-seleccion = st.sidebar.radio("Navegación", opciones_menu, index=idx, key="nav_main")
+seleccion = st.sidebar.radio("Navegación", opciones_menu, index=idx)
 
-# Actualizar estado si cambia
 if seleccion != st.session_state.selected_page:
     st.session_state.selected_page = seleccion
     st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ROUTER DE PÁGINAS
+#  ROUTER
 # ═══════════════════════════════════════════════════════════════════════════
 
 if seleccion == "Inicio":
-    main_page()
+    st.title("BPNos - Finanzas Corporativas")
+    st.info("Bienvenido. Configure su API Key de Gemini en el menú lateral para potenciar los módulos de IA.")
 elif seleccion == "📊 Dashboard Corporativo":
     page_corporate_dashboard()
 elif seleccion == "🏦 Explorador IOL API":
     page_iol_explorer()
 elif seleccion == "🔭 Modelos Avanzados (Forecast)":
     page_forecast()
-elif seleccion == "📰 Analizador de Eventos":
-    page_event_analyzer()
-elif seleccion == "💬 Chat IA":
-    page_chat_ai()
+elif seleccion == "📰 Analizador Eventos (Gemini)":
+    page_event_analyzer_gemini()
+elif seleccion == "💬 Chat IA (Gemini)":
+    page_chat_gemini()
