@@ -8,10 +8,19 @@ from bs4 import BeautifulSoup
 import time
 import traceback
 import json
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy.optimize import minimize
+from scipy.stats import norm
 from huggingface_hub import InferenceClient
 import yfinance as yf
-from scipy.optimize import minimize
-import plotly.express as px
+
+# ── Dependencia opcional para optimización institucional ──
+try:
+    from pypfopt import EfficientFrontier, risk_models, expected_returns
+    PYPFOPT_OK = True
+except ImportError:
+    PYPFOPT_OK = False
 
 # ── Módulos propios ───────────────────────────────────────────────────────
 # Asegúrate de tener forecast_module.py y iol_client.py en la misma carpeta
@@ -19,7 +28,7 @@ from forecast_module import page_forecast
 from iol_client import page_iol_explorer, get_iol_client
 
 # ── Configuración ─────────────────────────────────────────────────────────
-st.set_page_config(layout="wide", page_title="BPNos – Inversiones y Análisis")
+st.set_page_config(layout="wide", page_title="BPNos – Finanzas Corporativas")
 
 PORTFOLIO_FILE = "portfolios_data1.json"
 
@@ -46,7 +55,6 @@ def save_portfolios_to_file(portfolios_dict):
         return False, str(e)
 
 def parse_tickers_from_text(text_data):
-    """Parsea tickers de un texto pegado (ej. desde un PDF o web de IOL)"""
     tickers_by_sector = {}
     current_sector = "General"
     all_tickers_info =[]
@@ -54,8 +62,7 @@ def parse_tickers_from_text(text_data):
 
     for line in text_data.strip().split('\n'):
         line = line.strip()
-        if not line:
-            continue
+        if not line: continue
         if line.startswith(">") and ":" in line:
             current_sector = line.split(":")[0].replace(">", "").strip()
             continue
@@ -65,91 +72,15 @@ def parse_tickers_from_text(text_data):
             ticker = match.group(2).strip()
             if ticker:
                 all_tickers_info.append({
-                    "ticker": ticker,
-                    "nombre": company_name,
-                    "sector": current_sector
+                    "ticker": ticker, "nombre": company_name, "sector": current_sector
                 })
     return all_tickers_info
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCRAPING IOL (Público, sin Auth)
+#  DATOS FINANCIEROS Y OPTIMIZACIÓN CORPORATIVA
 # ═══════════════════════════════════════════════════════════════════════════
 
-def scrape_table(url, min_cols, max_rows=None):
-    try:
-        headers  = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=8)
-        response.raise_for_status()
-        soup  = BeautifulSoup(response.content, "html.parser")
-        table = soup.find("table")
-        if not table:
-            return {"error": "No se encontro la tabla."}
-        rows = table.find_all("tr")[1:]
-        if max_rows:
-            rows = rows[:max_rows]
-        return {"rows": rows, "actualizado": time.strftime("%Y-%m-%d %H:%M")}
-    except Exception as e:
-        return {"error": str(e)}
-
-@st.cache_data(ttl=300)
-def scrape_iol_monedas():
-    url = "https://iol.invertironline.com/mercado/cotizaciones/argentina/monedas"
-    result = scrape_table(url, min_cols=5)
-    if "error" in result: return result
-    data = []
-    for row in result["rows"]:
-        cols = row.find_all("td")
-        if len(cols) >= 5:
-            compra = cols[1].get_text(strip=True).replace(".", "").replace(",", ".")
-            venta  = cols[2].get_text(strip=True).replace(".", "").replace(",", ".")
-            if compra != "-" and venta != "-":
-                try:
-                    float(compra); float(venta)
-                    data.append({"moneda": cols[0].get_text(strip=True), "compra": compra, "venta": venta,
-                                 "fecha": cols[3].get_text(strip=True), "variacion": cols[4].get_text(strip=True)})
-                except ValueError: continue
-    return {"fuente": url, "datos": data, "actualizado": result["actualizado"]}
-
-@st.cache_data(ttl=600)
-def scrape_iol_fondos():
-    url = "https://iol.invertironline.com/mercado/cotizaciones/argentina/fondos/todos"
-    result = scrape_table(url, min_cols=9)
-    if "error" in result: return result
-    data =[]
-    for row in result["rows"][:20]:
-        cols = row.find_all("td")
-        if len(cols) >= 9:
-            s = cols[3].get_text(strip=True).replace("AR$ ", "").replace("US$ ", "")
-            if s and s != "-":
-                try:
-                    data.append({"fondo": cols[0].get_text(strip=True),
-                                 "ultimo": float(s.replace(".", "").replace(",", ".")),
-                                 "variacion": cols[4].get_text(strip=True)})
-                except ValueError: continue
-    return {"fuente": url, "datos": data, "actualizado": result["actualizado"]}
-
-@st.cache_data(ttl=600)
-def scrape_iol_bonos():
-    url = "https://iol.invertironline.com/mercado/cotizaciones/argentina/bonos/todos"
-    result = scrape_table(url, min_cols=13)
-    if "error" in result: return result
-    data = []
-    for row in result["rows"][:30]:
-        cols = row.find_all("td")
-        if len(cols) >= 13:
-            s = cols[1].get_text(strip=True)
-            if s and s != "-":
-                try:
-                    data.append({"simbolo": cols[0].get_text(strip=True).replace("\n","").strip(),
-                                 "ultimo": float(s.replace(".", "").replace(",", ".")),
-                                 "variacion": cols[2].get_text(strip=True)})
-                except ValueError: continue
-    return {"fuente": url, "datos": data, "actualizado": result["actualizado"]}
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  LÓGICA DE DATOS FINANCIEROS Y PORTAFOLIOS
-# ═══════════════════════════════════════════════════════════════════════════
-
+@st.cache_data(show_spinner=False)
 def fetch_stock_prices_for_portfolio(tickers, start_date, end_date):
     client = get_iol_client()
     all_prices = {}
@@ -162,12 +93,15 @@ def fetch_stock_prices_for_portfolio(tickers, start_date, end_date):
             fmt_start = pd.to_datetime(start_date).strftime("%Y-%m-%d")
             fmt_end   = pd.to_datetime(end_date).strftime("%Y-%m-%d")
 
-            df_hist = client.get_serie_historica(simbolo_iol, fmt_start, fmt_end)
-            if not df_hist.empty and "ultimoPrecio" in df_hist.columns:
-                s = df_hist["ultimoPrecio"].rename(ticker)
-                if s.index.tz is not None: s.index = s.index.tz_localize(None)
-                all_prices[ticker] = s
-                fetched = True
+            try:
+                df_hist = client.get_serie_historica(simbolo_iol, fmt_start, fmt_end)
+                if not df_hist.empty and "ultimoPrecio" in df_hist.columns:
+                    s = df_hist["ultimoPrecio"].rename(ticker)
+                    if s.index.tz is not None: s.index = s.index.tz_localize(None)
+                    all_prices[ticker] = s
+                    fetched = True
+            except:
+                pass
         if not fetched:
             yf_tickers.append(ticker)
 
@@ -193,60 +127,82 @@ def calculate_portfolio_performance(prices, weights):
     returns = prices.pct_change().dropna()
     return (1 + (returns * weights).sum(axis=1)).cumprod()
 
-def optimize_portfolio(prices, risk_free_rate=0.0, opt_type="Minima Volatilidad"):
+def optimize_portfolio_corporate(prices, risk_free_rate=0.02, opt_type="Maximo Ratio Sharpe"):
+    """
+    Motor de optimización institucional. 
+    Intenta usar PyPortfolioOpt; si no está, usa Scipy optimizado para Finanzas Corporativas.
+    """
     returns = prices.pct_change().dropna()
     if returns.empty: return None
-    mean_returns = returns.mean()
-    cov_matrix   = returns.cov()
+
+    # Si el usuario tiene PyPortfolioOpt instalado (Código 2)
+    if PYPFOPT_OK:
+        mu = expected_returns.mean_historical_return(prices, frequency=252)
+        S = risk_models.sample_cov(prices, frequency=252)
+        ef = EfficientFrontier(mu, S, weight_bounds=(0, 1))
+        
+        if opt_type == "Maximo Ratio Sharpe": ef.max_sharpe(risk_free_rate=risk_free_rate)
+        elif opt_type == "Minima Volatilidad": ef.min_volatility()
+        else: ef.max_quadratic_utility(risk_aversion=2)
+        
+        weights = ef.clean_weights()
+        ret, vol, sharpe = ef.portfolio_performance(verbose=False, risk_free_rate=risk_free_rate)
+        ow_array = np.array([weights.get(t, 0) for t in prices.columns])
+        
+        return {"weights": ow_array, "expected_return": ret, "volatility": vol, 
+                "sharpe_ratio": sharpe, "tickers": list(prices.columns), "returns": returns}
+    
+    # Fallback mejorado con Scipy (Código 3 repotenciado)
+    mean_returns = returns.mean() * 252
+    cov_matrix   = returns.cov() * 252
     n            = len(mean_returns)
     constraints  = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
     bounds       = tuple((0, 1) for _ in range(n))
     init         = np.array([1/n] * n)
 
-    if "Volatilidad" in opt_type: obj = lambda w: np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
-    elif "Retorno" in opt_type: obj = lambda w: -np.sum(mean_returns * w)
+    if opt_type == "Minima Volatilidad":
+        obj = lambda w: np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
+    elif opt_type == "Retorno Maximo":
+        obj = lambda w: -np.sum(mean_returns * w)
     else: # Sharpe
-        def obj(w):
-            r = np.sum(mean_returns * w)
-            v = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
-            return -(r - risk_free_rate) / v if v > 0 else np.inf
+        obj = lambda w: -(np.sum(mean_returns * w) - risk_free_rate) / np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
 
     res = minimize(obj, init, method='SLSQP', bounds=bounds, constraints=constraints)
     if not res.success: return None
+    
     ow  = res.x
     er  = np.sum(mean_returns * ow)
     ev  = np.sqrt(np.dot(ow.T, np.dot(cov_matrix, ow)))
-    out = {"weights": ow, "expected_return": er, "volatility": ev, "tickers": list(prices.columns)}
-    if "Sharpe" in opt_type: out["sharpe_ratio"] = (er - risk_free_rate) / ev if ev > 0 else 0
-    return out
-
+    sharpe = (er - risk_free_rate) / ev if ev > 0 else 0
+    
+    return {"weights": ow, "expected_return": er, "volatility": ev, 
+            "sharpe_ratio": sharpe, "tickers": list(prices.columns), "returns": returns}
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  PÁGINAS DE LA APLICACIÓN
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main_page():
-    st.title("BPNos - Consola de Inversiones")
+    st.title("BPNos - Consola de Finanzas Corporativas")
     st.markdown("""
-    Bienvenido a la plataforma consolidada. Usa el menú lateral para navegar.
+    Bienvenido a la plataforma consolidada. Hemos potenciado las herramientas para integrar pronósticos con administración de carteras.
 
-    | Sección | Descripción |
+    | Módulo Estratégico | Descripción Corporativa |
     |---|---|
-    | 🏦 Explorador IOL API | Tu cuenta de InvertirOnline: cotizaciones, FCI, Dólar MEP y Series Históricas. |
-    | 💼 Portafolios | Crea, edita y analiza el rendimiento de tus carteras de inversión. |
-    | 📊 Optimización | Calcula pesos óptimos usando Teoría de Markowitz (Liviano y rápido). |
-    | 🔭 Pronóstico | Modelos predictivos (SARIMAX / Prophet) con variables macroeconómicas exógenas. |
-    | 📰 Analizador de Eventos | Demo conceptual de análisis rápido de impacto de noticias en activos. |
-    | 💬 Chat AI | Chatbot financiero con IA de Hugging Face. |
+    | 🏦 **Explorador IOL** | Conexión directa al mercado para captura de precios reales. |
+    | 💼 **Gestión de Portafolios** | Estructuración de activos (Capital Allocation). |
+    | 📊 **Corporate Opt. & Forecast** | **[NUEVO]** Optimización de Markowitz unida a proyecciones futuras predictivas (Value at Risk, Montecarlo). |
+    | 🔭 **Pronóstico Avanzado** | Modelos econométricos (SARIMAX/Prophet) para evaluación de activos individuales. |
+    | 📰 **Analizador de Eventos** | Evaluación de sentimiento sobre eventos corporativos de mercado. |
     """)
 
 def page_create_portfolio():
     st.header("💼 Crear / Editar Portafolio")
     portfolio_name = st.text_input("Nombre del portafolio")
-    tickers_input  = st.text_area("Tickers (separados por comas)", "AL30, GGAL")
-    weights_input  = st.text_area("Pesos decimales (deben sumar 1.0)", "0.5, 0.5")
+    tickers_input  = st.text_area("Tickers (separados por comas)", "AL30, GGAL, YPFD.BA")
+    weights_input  = st.text_area("Pesos decimales (deben sumar 1.0)", "0.4, 0.3, 0.3")
 
-    if st.button("Guardar Manualmente"):
+    if st.button("Guardar Portafolio", type="primary"):
         if tickers_input and weights_input:
             tickers_list =[t.strip().upper() for t in tickers_input.split(",") if t.strip()]
             try: weights_list =[float(w.strip()) for w in weights_input.split(",") if w.strip()]
@@ -260,22 +216,11 @@ def page_create_portfolio():
             ok, msg = save_portfolios_to_file(portfolios)
             if ok:
                 st.session_state.portfolios = portfolios
-                st.success("✅ Portafolio guardado correctamente.")
+                st.success("✅ Portafolio corporativo guardado correctamente.")
             else: st.error(f"❌ Error al guardar: {msg}")
 
-    st.markdown("---")
-    st.subheader("Portafolios Guardados")
-    portfolios = st.session_state.get("portfolios", {})
-    if portfolios:
-        for name, data in portfolios.items():
-            with st.expander(name):
-                df = pd.DataFrame({"Ticker": data["tickers"], "Peso": data["weights"]})
-                st.dataframe(df, hide_index=True)
-    else:
-        st.info("No hay portafolios creados.")
-
 def page_view_portfolio_returns():
-    st.header("📈 Rendimiento de Portafolio")
+    st.header("📈 Rendimiento Histórico")
     portfolios = st.session_state.get("portfolios", {})
     if not portfolios:
         st.warning("No hay portafolios guardados."); return
@@ -291,77 +236,148 @@ def page_view_portfolio_returns():
             prices = fetch_stock_prices_for_portfolio(portfolio["tickers"], start_date, end_date)
         if prices is not None:
             returns = calculate_portfolio_performance(prices, portfolio["weights"])
-            st.line_chart(returns)
-            st.metric("Retorno Acumulado", f"{(returns.iloc[-1] - 1)*100:.2f}%")
+            
+            # Gráfico enriquecido
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=returns.index, y=returns.values, mode='lines', 
+                                     name=name, line=dict(color='#2ca02c', width=2)))
+            fig.update_layout(title="Crecimiento del Capital (Base 1)", template="plotly_dark", hovermode="x unified")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.metric("Retorno Acumulado Total", f"{(returns.iloc[-1] - 1)*100:.2f}%")
 
-def page_optimize_portfolio():
-    st.header("📊 Optimización de Cartera (Markowitz)")
+def page_optimize_and_forecast():
+    """
+    Sinergia: Inversiones + Forecast.
+    Optimiza el portafolio y proyecta su comportamiento futuro usando simulación estocástica.
+    """
+    st.header("📊 Corporate Finance: Optimización & Proyección Predictiva")
+    st.markdown("Integra la **Frontera Eficiente de Markowitz** con modelos de **Proyección Estocástica (Forecast)** para medir riesgo corporativo.")
+    
     portfolios = st.session_state.get("portfolios", {})
-    if not portfolios: st.warning("No hay portafolios guardados."); return
-    name = st.selectbox("Selecciona Portafolio", list(portfolios.keys()))
+    if not portfolios: st.warning("Crea un portafolio primero."); return
+    name = st.selectbox("Selecciona Portafolio base para analizar", list(portfolios.keys()))
     portfolio = portfolios[name]
     
-    start_date = st.date_input("Historial Desde", value=pd.to_datetime("2023-01-01"))
-    end_date   = st.date_input("Historial Hasta", value=pd.to_datetime("today"))
-    opt_type   = st.selectbox("Objetivo", ["Maximo Ratio Sharpe", "Minima Volatilidad", "Retorno Maximo"])
+    with st.expander("⚙️ Parámetros del Modelo Corporativo", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1: start_date = st.date_input("Historial Desde", value=pd.to_datetime("2023-01-01"))
+        with c2: end_date   = st.date_input("Historial Hasta", value=pd.to_datetime("today"))
+        with c3: opt_type   = st.selectbox("Objetivo de Asignación",["Maximo Ratio Sharpe", "Minima Volatilidad", "Retorno Maximo"])
+        
+        c4, c5 = st.columns(2)
+        with c4: risk_free = st.number_input("Tasa Libre de Riesgo (Anual)", value=0.04, step=0.01)
+        with c5: forecast_days = st.slider("Días de Proyección Futura (Forecast)", 10, 252, 60)
     
-    if st.button("Optimizar Pesos"):
-        with st.spinner("Calculando frontera eficiente..."):
+    if st.button("🚀 Ejecutar Análisis Integral (Optimización + Forecast)", type="primary"):
+        with st.spinner("Optimizando activos y generando proyecciones..."):
             prices = fetch_stock_prices_for_portfolio(portfolio["tickers"], start_date, end_date)
-        if prices is not None and len(prices) > 1:
-            result = optimize_portfolio(prices, opt_type=opt_type)
-            if result:
-                st.success("✅ Optimización completada.")
-                c1, c2 = st.columns(2)
-                with c1: st.metric("Retorno Esperado", f"{result['expected_return']:.2%}")
-                with c2: st.metric("Volatilidad Esperada", f"{result['volatility']:.2%}")
-                
-                wdf = pd.DataFrame({"Ticker": result["tickers"], "Peso Óptimo": result["weights"]})
-                wdf = wdf[wdf["Peso Óptimo"] > 0.01] # Filtrar pesos irrelevantes
-                fig = px.pie(wdf, values='Peso Óptimo', names='Ticker', title='Distribución Óptima')
-                st.plotly_chart(fig, use_container_width=True)
+            
+        if prices is not None and len(prices.columns) > 1:
+            res = optimize_portfolio_corporate(prices, risk_free_rate=risk_free, opt_type=opt_type)
+            if not res: st.error("No se pudo optimizar."); return
+            
+            # --- 1. RESULTADOS DE OPTIMIZACIÓN ---
+            st.subheader("1. Asignación Óptima de Capital")
+            
+            wdf = pd.DataFrame({"Activo": res["tickers"], "Peso": res["weights"]})
+            wdf = wdf[wdf["Peso"] > 0.005] # Filtra < 0.5%
+            
+            col_chart, col_metrics = st.columns([1, 1])
+            with col_chart:
+                fig_pie = px.pie(wdf, values='Peso', names='Activo', hole=0.4, 
+                                 title="Distribución del Portafolio Institucional", template="plotly_dark")
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with col_metrics:
+                # Métricas Corporativas (Value at Risk)
+                var_95 = norm.ppf(0.05, res["expected_return"]/252, res["volatility"]/np.sqrt(252))
+                st.markdown("### KPIs de Riesgo Corporativo")
+                st.metric("Retorno Esperado Anual (CAGR)", f"{res['expected_return']:.2%}")
+                st.metric("Volatilidad Anual (Riesgo)", f"{res['volatility']:.2%}")
+                st.metric("Ratio de Sharpe", f"{res['sharpe_ratio']:.2f}")
+                st.metric("Value at Risk (VaR 95% Diario)", f"{var_95:.2%}", help="Máxima pérdida diaria esperada con un 95% de confianza.")
+
+            # --- 2. SINERGIA CON FORECAST (MONTECARLO) ---
+            st.markdown("---")
+            st.subheader("2. Proyección Futura (Forecast Mode)")
+            st.caption(f"Simulación predictiva del portafolio óptimo a {forecast_days} días hábiles.")
+            
+            # Cálculo de trayectorias (Montecarlo básico de Movimiento Browniano Geométrico)
+            S0 = 100 # Capital base simulado
+            dt = 1/252
+            mu_d = res["expected_return"] * dt
+            sigma_d = res["volatility"] * np.sqrt(dt)
+            simulations = 500
+            
+            paths = np.zeros((forecast_days, simulations))
+            paths[0] = S0
+            for t in range(1, forecast_days):
+                Z = np.random.standard_normal(simulations)
+                paths[t] = paths[t-1] * np.exp((mu_d - 0.5 * sigma_d**2) + sigma_d * Z)
+            
+            # Extraer proyecciones (media, p5, p95)
+            mean_path = paths.mean(axis=1)
+            p5_path = np.percentile(paths, 5, axis=1)
+            p95_path = np.percentile(paths, 95, axis=1)
+            future_dates = pd.date_range(end_date, periods=forecast_days, freq="B")
+            
+            # Gráfico de Forecast Corporativo
+            fig_fc = go.Figure()
+            # Cono de Incertidumbre
+            fig_fc.add_trace(go.Scatter(x=future_dates.tolist() + future_dates[::-1].tolist(),
+                                        y=p95_path.tolist() + p5_path[::-1].tolist(),
+                                        fill='toself', fillcolor='rgba(255,213,79,0.2)', line=dict(color='rgba(255,255,255,0)'),
+                                        name="Cono de Incertidumbre (90%)"))
+            # Ruta Media Proyectada
+            fig_fc.add_trace(go.Scatter(x=future_dates, y=mean_path, mode='lines', 
+                                        name="Ruta Esperada (Forecast)", line=dict(color='#FFD54F', width=3)))
+            
+            fig_fc.update_layout(title="Forecast del Portafolio Óptimo (Capital Base 100)",
+                                 template="plotly_dark", yaxis_title="Valor Proyectado", xaxis_title="Fecha")
+            st.plotly_chart(fig_fc, use_container_width=True)
+            
+            st.info("💡 **Insights Corporativos:** Esta proyección vincula el peso óptimo de cada activo (Inversiones) con su expectativa estadística futura (Forecast), permitiendo a los gestores prever requerimientos de capital y tolerancias de riesgo corporativo.")
 
 def page_event_analyzer():
-    st.header("📰 Analizador de Eventos (Demo Sentimiento)")
-    st.warning("Esta herramienta hace una búsqueda básica de palabras clave. No constituye consejo financiero.")
+    st.header("📰 Analizador de Eventos Corporativos")
+    st.warning("Evaluación de impacto en sentimiento para activos específicos.")
+    pos_kw =["crecimiento", "supera", "acuerdo", "beneficio", "ganancia", "récord", "mejora", "upgrade"]
+    neg_kw =["caída", "pérdida", "retraso", "multa", "riesgo", "incertidumbre", "crisis", "downgrade"]
     
-    pos_kw =["crecimiento", "supera", "acuerdo", "beneficio", "ganancia", "récord", "mejora"]
-    neg_kw =["caída", "pérdida", "retraso", "multa", "riesgo", "incertidumbre", "crisis"]
-    
-    news_text = st.text_area("Pega el fragmento de la noticia aquí:", height=150)
+    news_text = st.text_area("Pega el comunicado corporativo / noticia aquí:", height=150)
     tickers = st.text_input("Tickers afectados (separados por coma):", "GGAL")
     
-    if st.button("Analizar Texto"):
+    if st.button("Evaluar Sentimiento"):
         if news_text and tickers:
-            t_list = [t.strip().upper() for t in tickers.split(",")]
+            t_list =[t.strip().upper() for t in tickers.split(",")]
             text_lower = news_text.lower()
             
             p_score = sum(1 for kw in pos_kw if kw in text_lower)
             n_score = sum(1 for kw in neg_kw if kw in text_lower)
             
             if p_score > n_score:
-                st.success(f"📈 **POTENCIAL ALCISTA** ({p_score} keywords positivas vs {n_score} negativas)")
+                st.success(f"📈 **EXPECTATIVA ALCISTA** ({p_score} señales positivas vs {n_score} negativas)")
             elif n_score > p_score:
-                st.error(f"📉 **POTENCIAL BAJISTA** ({n_score} keywords negativas vs {p_score} positivas)")
+                st.error(f"📉 **EXPECTATIVA BAJISTA** ({n_score} señales negativas vs {p_score} positivas)")
             else:
-                st.info(f"❓ **NEUTRAL / INCIERTO** (Empate de keywords)")
-            
-            st.caption(f"Activos evaluados: {', '.join(t_list)}")
+                st.info(f"❓ **IMPACTO NEUTRAL** (Señales mixtas o nulas)")
+            st.caption(f"Activos analizados: {', '.join(t_list)}")
 
 def page_investment_insights_chat():
-    st.header("💬 Asistente AI (Hugging Face)")
+    st.header("💬 Asistente Corporativo AI")
     if not st.session_state.get('hf_api_key'):
-        st.warning("Ingresa tu API Key de Hugging Face en la barra lateral.")
+        st.warning("Configura tu API Key de Hugging Face en el panel lateral.")
         return
     
     if 'chat_messages' not in st.session_state: st.session_state.chat_messages =[]
     for msg in st.session_state.chat_messages:
         st.chat_message(msg["role"]).write(msg["content"])
         
-    if prompt := st.chat_input("Consulta sobre inversiones..."):
+    if prompt := st.chat_input("Análisis financiero, dudas de mercado, etc..."):
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
-        with st.spinner("Pensando..."):
+        with st.spinner("Analizando..."):
             try:
                 client = InferenceClient(api_key=st.session_state.hf_api_key)
                 resp = client.chat_completion(
@@ -369,10 +385,9 @@ def page_investment_insights_chat():
                     messages=[{"role": "user", "content": prompt}], max_tokens=500
                 ).choices[0].message.content
             except Exception as e:
-                resp = f"Error: {e}"
+                resp = f"Error del modelo: {e}"
         st.session_state.chat_messages.append({"role": "assistant", "content": resp})
         st.chat_message("assistant").write(resp)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN INICIAL (SESSION STATE)
@@ -393,38 +408,32 @@ if 'portfolios' not in st.session_state:
 # ═══════════════════════════════════════════════════════════════════════════
 st.sidebar.title("Configuración")
 
-# 1. API IOL
-with st.sidebar.expander("🏦 Cuenta InvertirOnline", expanded=True):
+with st.sidebar.expander("🏦 Cuenta InvertirOnline", expanded=False):
     iol_user = st.text_input("Usuario / Email", value=st.session_state.get("iol_username",""), key="iol_u")
     iol_pass = st.text_input("Contraseña", type="password", value=st.session_state.get("iol_password",""), key="iol_p")
     if iol_user: st.session_state.iol_username = iol_user
     if iol_pass: st.session_state.iol_password = iol_pass
-
     if st.button("🔐 Conectar IOL", use_container_width=True):
         with st.spinner("Autenticando..."):
             c = get_iol_client()
             if c: st.success("✅ Conectado")
             else: st.error("❌ Error credenciales")
 
-# 2. IA Keys
-with st.sidebar.expander("🤖 API Keys de Inteligencia Artificial"):
-    gk = st.text_input("Google Gemini (Pronósticos)", type="password", value=st.session_state.get('gemini_api_key',''))
+with st.sidebar.expander("🤖 API Keys de IA"):
+    gk = st.text_input("Google Gemini (Forecast)", type="password", value=st.session_state.get('gemini_api_key',''))
     if gk: st.session_state.gemini_api_key = gk
     hk = st.text_input("Hugging Face (Chatbot)", type="password", value=st.session_state.get('hf_api_key',''))
     if hk: st.session_state.hf_api_key = hk
 
-# 3. Herramienta de Parseo de Tickers
-with st.sidebar.expander("📋 Lector de Tickers IOL (Copiar/Pegar)"):
-    st.caption("Pega la lista de activos de la web de IOL para extraer los tickers.")
-    ocr_text = st.text_area("Texto a parsear:", height=100)
-    if st.button("Extraer Tickers", use_container_width=True):
+with st.sidebar.expander("📋 Lector de Tickers IOL"):
+    ocr_text = st.text_area("Pega la lista de activos de IOL:", height=100)
+    if st.button("Extraer", use_container_width=True):
         if ocr_text:
             parsed = parse_tickers_from_text(ocr_text)
             if parsed:
                 t_list = [item["ticker"] for item in parsed]
-                st.success(f"Extraídos {len(t_list)} tickers.")
                 st.code(", ".join(t_list))
-            else: st.warning("No se encontraron tickers con formato (TICKER).")
+            else: st.warning("No se encontraron tickers.")
 
 st.sidebar.markdown("---")
 st.sidebar.title("Menú Principal")
@@ -432,12 +441,12 @@ page_options =[
     "Inicio",
     "🏦 Explorador IOL API",
     "💼 Gestión de Portafolios",
-    "📈 Rendimiento Histórico",
-    "📊 Optimización (Markowitz)",
-    "🔭 Pronóstico (SARIMAX/Prophet)",
+    "📊 Corp. Finance: Opt & Forecast",
+    "🔭 Pronóstico Avanzado (Models)",
     "📰 Analizador de Eventos",
     "💬 Chat IA Financiero"
 ]
+
 page = st.sidebar.radio("Sección", page_options, index=page_options.index(st.session_state.selected_page))
 if page != st.session_state.selected_page:
     st.session_state.selected_page = page
@@ -450,8 +459,7 @@ sel = st.session_state.selected_page
 if   sel == "Inicio":                       main_page()
 elif sel == "🏦 Explorador IOL API":        page_iol_explorer()
 elif sel == "💼 Gestión de Portafolios":    page_create_portfolio()
-elif sel == "📈 Rendimiento Histórico":     page_view_portfolio_returns()
-elif sel == "📊 Optimización (Markowitz)":  page_optimize_portfolio()
-elif sel == "🔭 Pronóstico (SARIMAX/Prophet)": page_forecast()
+elif sel == "📊 Corp. Finance: Opt & Forecast": page_optimize_and_forecast()
+elif sel == "🔭 Pronóstico Avanzado (Models)": page_forecast()
 elif sel == "📰 Analizador de Eventos":     page_event_analyzer()
 elif sel == "💬 Chat IA Financiero":        page_investment_insights_chat()
