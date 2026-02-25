@@ -10,9 +10,14 @@ import plotly.graph_objects as go
 from scipy.optimize import minimize
 from scipy.stats import norm
 import yfinance as yf
+from datetime import timedelta
 
-# ── NUEVA DEPENDENCIA DE IA (GOOGLE GEMINI) ──
-import google.generativeai as genai
+# ── IMPORTACIÓN SEGURA DE GOOGLE GEMINI ──
+try:
+    import google.generativeai as genai
+    GEMINI_OK = True
+except ImportError:
+    GEMINI_OK = False
 
 # ── Dependencia opcional para optimización institucional ──
 try:
@@ -21,12 +26,11 @@ try:
 except ImportError:
     PYPFOPT_OK = False
 
-# ── Módulos propios (Deben existir en la misma carpeta) ──
+# ── Módulos propios (Manejo de errores si no existen) ──
 try:
     from forecast_module import page_forecast
     from iol_client import page_iol_explorer, get_iol_client
 except ImportError:
-    # Fallback si no existen los archivos auxiliares
     def page_forecast(): st.warning("Módulo forecast_module.py no encontrado.")
     def page_iol_explorer(): st.warning("Módulo iol_client.py no encontrado.")
     def get_iol_client(): return None
@@ -260,10 +264,109 @@ def page_corporate_dashboard():
                 st.plotly_chart(fig, use_container_width=True)
         else: st.info("Ejecute optimización primero.")
 
+def page_yahoo_explorer():
+    """NUEVO: Explorador de Mercado Global con Yahoo Finance."""
+    st.title("🌎 Explorador de Mercado (Yahoo Finance)")
+    st.caption("Visualización avanzada para Activos Globales y CEDEARs.")
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        ticker = st.text_input("Ticker Symbol", value="AAPL").upper()
+        if not ticker: return
+    with c2:
+        period = st.selectbox("Periodo", ["1mo", "3mo", "6mo", "1y", "2y", "5y", "ytd", "max"], index=3)
+    
+    with st.spinner(f"Descargando datos de {ticker}..."):
+        try:
+            # Añadir sufijo .BA si es necesario (lógica simple)
+            search_ticker = ticker
+            if " " not in ticker and not ticker.isalpha(): 
+                pass # Es un ticker complejo, dejarlo como está
+            
+            stock = yf.Ticker(search_ticker)
+            hist = stock.history(period=period)
+            info = stock.info
+            
+            if hist.empty:
+                # Intento fallback con .BA
+                search_ticker = ticker + ".BA"
+                stock = yf.Ticker(search_ticker)
+                hist = stock.history(period=period)
+                info = stock.info
+
+            if hist.empty:
+                st.error(f"No se encontraron datos para {ticker}")
+                return
+
+            # --- SECCIÓN DE MÉTRICAS (Fundamentals) ---
+            st.subheader(f"{info.get('longName', ticker)} ({search_ticker})")
+            
+            m1, m2, m3, m4 = st.columns(4)
+            curr_price = info.get('currentPrice', hist['Close'].iloc[-1])
+            prev_close = info.get('previousClose', hist['Close'].iloc[-2] if len(hist)>1 else curr_price)
+            delta = ((curr_price - prev_close)/prev_close)*100
+            
+            m1.metric("Precio Actual", f"${curr_price:,.2f}", f"{delta:.2f}%")
+            m2.metric("Market Cap", f"${info.get('marketCap', 'N/A'):,}")
+            m3.metric("Beta (Volatilidad)", info.get('beta', 'N/A'))
+            m4.metric("Sector", info.get('sector', 'N/A'))
+
+            # --- GRÁFICO ---
+            tab_chart, tab_data = st.tabs(["📈 Gráfico Técnico", "📄 Datos Históricos"])
+            
+            with tab_chart:
+                # Checkbox Indicadores
+                c_ind1, c_ind2 = st.columns(2)
+                show_sma20 = c_ind1.checkbox("SMA 20 (Corto Plazo)", value=True)
+                show_sma50 = c_ind2.checkbox("SMA 50 (Medio Plazo)")
+
+                fig = go.Figure()
+                
+                # Velas
+                fig.add_trace(go.Candlestick(x=hist.index,
+                                open=hist['Open'], high=hist['High'],
+                                low=hist['Low'], close=hist['Close'],
+                                name='Precio'))
+                
+                # Medias Móviles
+                if show_sma20:
+                    sma20 = hist['Close'].rolling(window=20).mean()
+                    fig.add_trace(go.Scatter(x=hist.index, y=sma20, mode='lines', name='SMA 20', line=dict(color='orange', width=1)))
+                if show_sma50:
+                    sma50 = hist['Close'].rolling(window=50).mean()
+                    fig.add_trace(go.Scatter(x=hist.index, y=sma50, mode='lines', name='SMA 50', line=dict(color='cyan', width=1)))
+
+                fig.update_layout(
+                    title=f"Evolución de Precio - {ticker}",
+                    yaxis_title="Precio",
+                    xaxis_rangeslider_visible=False,
+                    template="plotly_dark",
+                    height=500
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Volumen
+                fig_vol = go.Figure(go.Bar(x=hist.index, y=hist['Volume'], marker_color='rgba(100, 200, 255, 0.5)'))
+                fig_vol.update_layout(title="Volumen Operado", height=200, template="plotly_dark", margin=dict(t=30))
+                st.plotly_chart(fig_vol, use_container_width=True)
+
+            with tab_data:
+                st.dataframe(hist.sort_index(ascending=False), use_container_width=True)
+                csv = hist.to_csv().encode('utf-8')
+                st.download_button("Descargar CSV", csv, f"{ticker}_data.csv", "text/csv")
+
+        except Exception as e:
+            st.error(f"Error al obtener datos: {str(e)}")
+
+
 def page_event_analyzer_gemini():
-    """Analizador de Eventos POTENCIADO con Gemini."""
+    """Analizador de Eventos con validación de librería."""
     st.header("📰 Analizador de Noticias con IA (Gemini)")
     
+    if not GEMINI_OK:
+        st.error("❌ Librería `google-generativeai` no instalada. Agreguela a requirements.txt")
+        return
+
     # Verificación de API Key
     api_key = st.session_state.get('gemini_api_key')
     if not api_key:
@@ -283,17 +386,15 @@ def page_event_analyzer_gemini():
             model = genai.GenerativeModel(st.session_state.gemini_model)
             
             prompt = f"""
-            Actúa como un analista financiero experto de Wall Street.
-            Analiza el siguiente texto de noticia/comunicado:
-            "{news_text}"
+            Actúa como un analista financiero experto.
+            Analiza el siguiente texto: "{news_text}"
 
-            1. Determina el Sentimiento: (Muy Alcista, Alcista, Neutral, Bajista, Muy Bajista).
-            2. Resume los 3 puntos clave financieros.
-            3. Estima el impacto a corto plazo en el precio de la acción (si se menciona alguna).
-            Responde en formato Markdown limpio.
+            1. Sentimiento: (Alcista/Bajista/Neutral).
+            2. 3 Puntos clave.
+            3. Impacto estimado.
             """
             
-            with st.spinner("Gemini está leyendo la noticia..."):
+            with st.spinner("Gemini analizando..."):
                 response = model.generate_content(prompt)
                 st.markdown("### 🧠 Análisis de IA")
                 st.markdown(response.text)
@@ -302,8 +403,12 @@ def page_event_analyzer_gemini():
             st.error(f"Error Gemini: {str(e)}")
 
 def page_chat_gemini():
-    """Chat Financiero usando Google Gemini."""
+    """Chat Financiero con validación de librería."""
     st.header("💬 Asistente Financiero Gemini")
+    
+    if not GEMINI_OK:
+        st.error("❌ Librería `google-generativeai` no instalada. Agreguela a requirements.txt")
+        return
     
     api_key = st.session_state.get('gemini_api_key')
     if not api_key:
@@ -317,14 +422,14 @@ def page_chat_gemini():
         role = "user" if msg["role"] == "user" else "assistant"
         st.chat_message(role).write(msg["content"])
 
-    if prompt := st.chat_input("Pregunta sobre mercados, estrategias, etc..."):
+    if prompt := st.chat_input("Pregunta sobre mercados..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
         with st.spinner("Gemini pensando..."):
             try:
                 genai.configure(api_key=api_key)
-                # Crear configuración de generación
+                # Crear configuración
                 generation_config = genai.types.GenerationConfig(
                     candidate_count=1,
                     temperature=0.7
@@ -332,14 +437,13 @@ def page_chat_gemini():
                 
                 model = genai.GenerativeModel(st.session_state.gemini_model)
                 
-                # Construir contexto simple (últimos 5 mensajes para no saturar tokens si no es Pro)
+                # Contexto simple (últimos mensajes)
                 chat_history = []
                 for m in st.session_state.messages[-6:]:
                     role = "user" if m["role"] == "user" else "model"
                     chat_history.append({'role': role, 'parts': [m["content"]]})
                 
-                # Iniciar chat con historia
-                chat = model.start_chat(history=chat_history[:-1]) # Todo menos el último prompt que se envía ahora
+                chat = model.start_chat(history=chat_history[:-1])
                 response = chat.send_message(prompt, generation_config=generation_config)
                 
                 resp_text = response.text
@@ -364,13 +468,10 @@ with st.sidebar.expander("🧠 Configuración IA (Gemini)", expanded=True):
     
     # Selector de Modelos solicitados
     model_options = [
-        "gemini-2.5-flash",   # Equivalente a tu pedido de 'gemini2.5flash' (lo más rápido y nuevo)
-        "gemini-3",     # Modelo potente (razonamiento alto)
-       
+        "gemini-2.5-flash",   
+        "gemini-3"
     ]
     st.session_state.gemini_model = st.selectbox("Modelo IA", model_options, index=0)
-    
-    st.caption("Nota: '2.0-flash' es el modelo experimental rápido más reciente disponible en la API.")
 
 with st.sidebar.expander("🏦 IOL Credenciales"):
     user_iol = st.text_input("Usuario IOL")
@@ -386,9 +487,10 @@ opciones_menu = [
     "Inicio",
     "📊 Dashboard Corporativo",
     "🏦 Explorador IOL API",
+    "🌎 Explorador Global (Yahoo)", # NUEVA OPCIÓN AÑADIDA
     "🔭 Modelos Avanzados (Forecast)",
-    "📰 Analizador Eventos (Gemini)", # Nombre actualizado
-    "💬 Chat IA (Gemini)"             # Nombre actualizado
+    "📰 Analizador Eventos (Gemini)",
+    "💬 Chat IA (Gemini)"
 ]
 
 try:
@@ -408,11 +510,16 @@ if seleccion != st.session_state.selected_page:
 
 if seleccion == "Inicio":
     st.title("BPNos - Finanzas Corporativas")
-    st.info("Bienvenido. Configure su API Key de Gemini en el menú lateral para potenciar los módulos de IA.")
+    st.info("Bienvenido. Configure su API Key de Gemini en el menú lateral.")
+    if not GEMINI_OK:
+        st.warning("⚠️ La librería de Google Gemini NO está instalada. Funciones de IA deshabilitadas.")
+    
 elif seleccion == "📊 Dashboard Corporativo":
     page_corporate_dashboard()
 elif seleccion == "🏦 Explorador IOL API":
     page_iol_explorer()
+elif seleccion == "🌎 Explorador Global (Yahoo)":
+    page_yahoo_explorer()
 elif seleccion == "🔭 Modelos Avanzados (Forecast)":
     page_forecast()
 elif seleccion == "📰 Analizador Eventos (Gemini)":
