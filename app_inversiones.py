@@ -442,7 +442,7 @@ if 'gemini_api_key' not in st.session_state: st.session_state.gemini_api_key = "
 st.sidebar.title("Configuración")
 with st.sidebar.expander("🧠 IA (Gemini)", expanded=True):
     st.session_state.gemini_api_key = st.text_input("API Key", value=st.session_state.gemini_api_key, type="password")
-    st.session_state.gemini_model = st.selectbox("Modelo", ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"])
+    st.session_state.gemini_model = st.selectbox("Modelo", ["gemini-2.5-flash", "gemini-3"])
 
 with st.sidebar.expander("🏦 IOL"):
     user_iol = st.text_input("Usuario IOL")
